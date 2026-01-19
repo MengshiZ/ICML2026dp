@@ -1,0 +1,86 @@
+{
+  "python": "python",
+  "entrypoint": "main.py",
+  "base_outdir": "./runs",
+
+  "global": {
+    "learning_rate": 0.4,
+    "momentum": 0.9,
+    "l2_norm_clip": 1.0,
+    "epochs": 5
+  },
+
+  "datasets": {
+    "mnist": {
+      "batch_size": 250,
+      "random_batch_delta": 1e-5
+    },
+    "cifar10": {
+      "batch_size": 500,
+      "random_batch_delta": 1e-5
+    },
+    "emnist_merge": {
+      "batch_size": 500,
+      "random_batch_delta": 1e-6
+    }
+  },
+
+  "sweeps": [
+    {
+      "name": "dp_ftrl_fixed_batch",
+      "data": ["mnist", "cifar10", "emnist_merge"],
+      "method": "dp_ftrl",
+      "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
+      "seeds": [0, 1, 2, 3, 4],
+      "params": {
+        "restart": 1,
+        "tree_completion": true,
+        "effi_noise": true,
+        "random_batch": false
+      }
+    },
+    {
+      "name": "dp_ftrl_random_batch",
+      "data": ["mnist"],
+      "method": "dp_ftrl",
+      "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0],
+      "seeds": [0, 1, 2],
+      "params": {
+        "restart": 1,
+        "tree_completion": true,
+        "effi_noise": true,
+        "random_batch": true
+      }
+    },
+    {
+      "name": "dp_sgd_amp",
+      "data": ["mnist", "cifar10", "emnist_merge"],
+      "method": "dp_sgd_amp",
+      "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
+      "seeds": [0, 1, 2, 3, 4],
+      "params": {
+        "random_batch": false
+      }
+    },
+    {
+      "name": "dp_sgd_noamp_fixed_batch",
+      "data": ["mnist", "cifar10", "emnist_merge"],
+      "method": "dp_sgd_noamp",
+      "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
+      "seeds": [0, 1, 2],
+      "params": {
+        "random_batch": false
+      }
+    },
+    {
+      "name": "dp_sgd_noamp_random_batch",
+      "data": ["mnist"],
+      "method": "dp_sgd_noamp",
+      "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0],
+      "seeds": [0, 1, 2],
+      "params": {
+        "random_batch": true
+      }
+    }
+  ]
+}
