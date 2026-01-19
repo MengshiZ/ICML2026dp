@@ -104,6 +104,8 @@ def make_train_loader(
     delta: float | None = None,
     num_workers: int = 0,
     pin_memory: bool = False,
+    worker_init_fn=None,
+    generator=None,
 ):
     """Create a DataLoader for training.
 
@@ -119,7 +121,14 @@ def make_train_loader(
             delta=delta,
             shuffle=shuffle,
         )
-        return DataLoader(dataset, batch_sampler=batch_sampler, num_workers=num_workers, pin_memory=pin_memory)
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            worker_init_fn=worker_init_fn,
+            generator=generator,
+        )
 
     return DataLoader(
         dataset,
@@ -128,4 +137,6 @@ def make_train_loader(
         drop_last=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        worker_init_fn=worker_init_fn,
+        generator=generator,
     )

@@ -22,6 +22,7 @@ from absl import flags
 
 import os
 from tqdm import trange
+import random
 import numpy as np
 
 import torch
@@ -40,6 +41,28 @@ import utils
 from utils import EasyDict
 
 
+# ======================================================
+# Fixed global random seed (DO NOT CHANGE)
+# ======================================================
+_FIXED_SEED = 12345
+
+random.seed(_FIXED_SEED)
+np.random.seed(_FIXED_SEED)
+torch.manual_seed(_FIXED_SEED)
+torch.cuda.manual_seed_all(_FIXED_SEED)
+
+# Ensure deterministic behavior (important for reproducibility).
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
+def _seed_worker(worker_id: int) -> None:
+    """Seed DataLoader workers deterministically."""
+    worker_seed = _FIXED_SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 FLAGS = flags.FLAGS
 
 flags.DEFINE_enum('data', 'mnist', ['mnist', 'cifar10', 'emnist_merge'], '')
@@ -52,9 +75,6 @@ flags.DEFINE_enum(
     'dp_sgd_amp: DP-SGD with privacy amplification via subsampling (Opacus accountant). '
     'dp_sgd_noamp: DP-SGD baseline without amplification (composed Gaussian).'
 )
-
-# Backward-compat: keep the old flag name. If explicitly set, it overrides method.
-flags.DEFINE_boolean('dp_ftrl', True, 'DEPRECATED. Use --method. If True -> dp_ftrl, else -> dp_sgd_noamp.')
 flags.DEFINE_float('noise_multiplier', 4.0, 'Ratio of the standard deviation to the clipping norm.')
 flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
 
@@ -71,27 +91,14 @@ flags.DEFINE_boolean('random_batch', False, 'If True, use variable batch sizes v
 flags.DEFINE_float('random_batch_delta', 1e-5, 'Delta parameter used to truncate the geometric noise (only if random_batch=True).')
 
 flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of samples. If -1, write every epoch.')
-
-flags.DEFINE_integer('run', 1, '(run-1) will be used for random seed.')
 flags.DEFINE_string('dir', '.', 'Directory to write the results.')
 
 
 def main(argv):
     # PyTorch-only: no TensorFlow / TFDS usage.
 
-    # Setup random seed
-    torch.backends.cudnn.deterministic = True
-    torch.manual_seed(FLAGS.run - 1)
-    np.random.seed(FLAGS.run - 1)
-
-    # Resolve training method (backward compatibility with --dp_ftrl).
+    # Training method is the single source of truth.
     method = FLAGS.method
-    try:
-        if FLAGS['method'].present is False and FLAGS['dp_ftrl'].present is True:
-            method = 'dp_ftrl' if FLAGS.dp_ftrl else 'dp_sgd_noamp'
-    except Exception:
-        # If the flag library changes, fall back to --method.
-        method = FLAGS.method
 
     if method == 'dp_sgd_amp' and FLAGS.random_batch:
         print('[WARN] --method=dp_sgd_amp assumes uniform random subsampling (privacy amplification). '
@@ -127,16 +134,19 @@ def main(argv):
         utils.get_fn(
             EasyDict(batch=batch),
             EasyDict(method=method, restart=FLAGS.restart, completion=FLAGS.tree_completion,
-                     noise=noise_multiplier, clip=clip, mb=1, random_batch=FLAGS.random_batch),
+                     noise=noise_multiplier, clip=clip, random_batch=FLAGS.random_batch),
             [
                 EasyDict({'lr': lr}),
                 EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None,
                          effi=FLAGS.effi_noise if is_ftrl else None),
-                EasyDict(sd=FLAGS.run)
             ],
         ),
     )
     print('Model dir', log_dir)
+
+    # Deterministic DataLoader RNG (for shuffle order, etc.).
+    _dl_gen = torch.Generator()
+    _dl_gen.manual_seed(_FIXED_SEED)
 
     # DataLoader (optionally with random/variable batch sizes).
     train_loader = make_train_loader(
@@ -147,6 +157,8 @@ def main(argv):
         delta=FLAGS.random_batch_delta if FLAGS.random_batch else None,
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=_seed_worker,
+        generator=_dl_gen,
     )
     test_loader = torch.utils.data.DataLoader(
         test_ds,
@@ -154,6 +166,8 @@ def main(argv):
         shuffle=False,
         num_workers=0,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=_seed_worker,
+        generator=_dl_gen,
     )
 
     # Function to conduct training for one epoch

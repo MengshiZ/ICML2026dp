@@ -8,7 +8,7 @@ def _bool_flag(v: Any) -> str:
     return "true" if bool(v) else "false"
 
 
-def build_cmd(cfg: Dict[str, Any], data_name: str, sweep: Dict[str, Any], nm: float, seed: int) -> List[str]:
+def build_cmd(cfg: Dict[str, Any], data_name: str, sweep: Dict[str, Any], nm: float) -> List[str]:
     py = cfg.get("python", sys.executable)
     entry = cfg.get("entrypoint", "main.py")
 
@@ -26,7 +26,6 @@ def build_cmd(cfg: Dict[str, Any], data_name: str, sweep: Dict[str, Any], nm: fl
         f"--data={data_name}",
         f"--method={method}",
         f"--noise_multiplier={nm}",
-        f"--seed={seed}",
     ]
 
     # dataset-level required args
@@ -73,11 +72,12 @@ def main() -> None:
 
     sweeps = cfg.get("sweeps", [])
 
+    # Number of repetitions per setting (optional). If not provided, defaults to 1.
+    # This is *not* seed control; it's just running the same command multiple times.
     total = 0
     for sweep in sweeps:
-        total += (
-            len(sweep["data"]) * len(sweep["noise_multiplier"]) * len(sweep["seeds"])
-        )
+        repeats = int(sweep.get("repeats", 1))
+        total += len(sweep["data"]) * len(sweep["noise_multiplier"]) * repeats
 
     print(f"Planned runs: {total}")
     run_idx = 0
@@ -87,10 +87,15 @@ def main() -> None:
         print(f"\n=== Sweep: {sweep_name} (method={sweep['method']}) ===")
         for data_name in sweep["data"]:
             for nm in sweep["noise_multiplier"]:
-                for seed in sweep["seeds"]:
+                repeats = int(sweep.get("repeats", 1))
+                if "seeds" in sweep:
+                    print("[WARN] 'seeds' is present in sweep_config.json but is ignored. "
+                          "This runner no longer sets seeds; use 'repeats' for multiple trials.")
+                for rep in range(repeats):
                     run_idx += 1
-                    cmd = build_cmd(cfg, data_name, sweep, nm, seed)
-                    print(f"\n[{run_idx}/{total}] " + " ".join(cmd))
+                    cmd = build_cmd(cfg, data_name, sweep, nm)
+                    suffix = f" (rep {rep + 1}/{repeats})" if repeats > 1 else ""
+                    print(f"\n[{run_idx}/{total}]{suffix} " + " ".join(cmd))
                     subprocess.run(cmd, check=True)
 
     print("\nAll sweeps completed.")

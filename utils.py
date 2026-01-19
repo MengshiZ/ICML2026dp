@@ -41,20 +41,43 @@ def get_fn(general_params, privacy_params, paramss, find_next=False):
     """Generate the output directory name given parameters."""
     dire = '_'.join([k + str(v) for k, v in general_params.items()]) + '/'
 
-    fn = []
-    if not privacy_params.dpsgd:
-        fn += ['nonpriv']
-    else:
-        fn += ['_'.join(
-            [k + str(privacy_params[k]) for k in sorted(privacy_params)
-             if k not in ['dpsgd', 'completion'] and privacy_params[k]])]
-        if privacy_params.completion:
-            fn += ['completion']
+    # We name runs by method rather than a legacy boolean flag.
+    # Expected: method in {dp_ftrl, dp_sgd_amp, dp_sgd_noamp}.
+    method = getattr(privacy_params, 'method', None)
+    if method is None:
+        # Backward compat: infer from legacy flags if present.
+        if getattr(privacy_params, 'dpsgd', False):
+            method = 'dp_sgd'
+        else:
+            method = 'nonpriv'
+
+    fn = [str(method)]
+
+    # Add key privacy params for easier filtering in TensorBoard.
+    # Convert to plain dict for stable iteration.
+    try:
+        pp_items = dict(privacy_params).items()
+    except Exception:
+        pp_items = getattr(privacy_params, '__dict__', {}).items()
+
+    skip = {'method', 'dpsgd'}
+    parts = []
+    for k, v in sorted(pp_items, key=lambda kv: kv[0]):
+        if k in skip:
+            continue
+        if v is None or v is False:
+            continue
+        if isinstance(v, bool):
+            parts.append(k)
+        else:
+            parts.append(k + str(v))
+    if parts:
+        fn.append('_'.join(parts))
 
     for params in paramss:
         s = []
         for k in sorted(params):
-            if not params[k]:
+            if params[k] is None or params[k] is False:
                 continue
             if isinstance(params[k], bool):
                 s.append(k)

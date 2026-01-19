@@ -31,7 +31,7 @@
       "data": ["mnist", "cifar10", "emnist_merge"],
       "method": "dp_ftrl",
       "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
-      "seeds": [0, 1, 2, 3, 4],
+      "repeats": 1,
       "params": {
         "restart": 1,
         "tree_completion": true,
@@ -44,7 +44,7 @@
       "data": ["mnist"],
       "method": "dp_ftrl",
       "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0],
-      "seeds": [0, 1, 2],
+      "repeats": 1,
       "params": {
         "restart": 1,
         "tree_completion": true,
@@ -57,7 +57,7 @@
       "data": ["mnist", "cifar10", "emnist_merge"],
       "method": "dp_sgd_amp",
       "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
-      "seeds": [0, 1, 2, 3, 4],
+      "repeats": 1,
       "params": {
         "random_batch": false
       }
@@ -67,7 +67,7 @@
       "data": ["mnist", "cifar10", "emnist_merge"],
       "method": "dp_sgd_noamp",
       "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
-      "seeds": [0, 1, 2],
+      "repeats": 1,
       "params": {
         "random_batch": false
       }
@@ -77,7 +77,7 @@
       "data": ["mnist"],
       "method": "dp_sgd_noamp",
       "noise_multiplier": [0.5, 1.0, 1.5, 2.0, 3.0, 4.0],
-      "seeds": [0, 1, 2],
+      "repeats": 1,
       "params": {
         "random_batch": true
       }
