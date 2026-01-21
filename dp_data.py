@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Iterable, List
+from typing import Iterable, List, Tuple, Dict, Optional
 
 import torch
 from torch.utils.data import DataLoader, Sampler, TensorDataset
@@ -101,8 +101,9 @@ def get_dp_dataloader(
     ntrain: int,
     mean_batch_size: int,
     delta: float,
-    shuffle: bool = True
-) -> Tuple[DataLoader, float, float]: # Returns DataLoader, sampler_epsilon, sampler_delta
+    shuffle: bool = True,
+    plan: Optional[Dict[str, object]] = None,
+) -> Tuple[DataLoader, float, float, int]: # Returns DataLoader, sampler_epsilon, sampler_delta, num_batches
     """
     Creates a DataLoader with TruncatedGeometricBatchSampler for DP training.
 
@@ -119,22 +120,84 @@ def get_dp_dataloader(
             - pytorch_train_loader: The DataLoader instance.
             - sampler_epsilon: The epsilon cost of the batch sampler.
             - sampler_delta: The delta cost of the batch sampler.
+            - num_batches: The number of batches in the plan.
     """
     # Create a PyTorch TensorDataset
     pytorch_train_dataset = TensorDataset(trainset_images, trainset_labels)
 
-    # Create the TruncatedGeometricBatchSampler
-    geometric_batch_sampler = TruncatedGeometricBatchSampler(
-        dataset_size=ntrain,
-        mean_batch_size=mean_batch_size,
-        delta=delta, 
-        shuffle=shuffle
+    if plan is None:
+        plan = plan_dp_batches(
+            dataset_size=ntrain,
+            mean_batch_size=mean_batch_size,
+            delta=delta,
+            shuffle=shuffle,
+        )
+
+    batch_sampler = PlannedBatchSampler(
+        indices=plan["indices"],
+        batch_sizes=plan["batch_sizes"],
     )
 
-    # Create a PyTorch DataLoader using the custom sampler
     pytorch_train_loader = DataLoader(
         pytorch_train_dataset,
-        batch_sampler=geometric_batch_sampler,
+        batch_sampler=batch_sampler,
     )
-    
-    return pytorch_train_loader, geometric_batch_sampler.sampler_epsilon, geometric_batch_sampler.sampler_delta
+
+    return (
+        pytorch_train_loader,
+        plan["sampler_epsilon"],
+        plan["sampler_delta"],
+        len(plan["batch_sizes"]),
+    )
+
+
+class PlannedBatchSampler(Sampler[List[int]]):
+    def __init__(self, indices: List[int], batch_sizes: List[int]) -> None:
+        self.indices = indices
+        self.batch_sizes = batch_sizes
+
+    def __iter__(self) -> Iterable[List[int]]:
+        start = 0
+        for size in self.batch_sizes:
+            end = start + size
+            yield self.indices[start:end]
+            start = end
+
+    def __len__(self) -> int:
+        return len(self.batch_sizes)
+
+
+def plan_dp_batches(
+    dataset_size: int,
+    mean_batch_size: int,
+    delta: float,
+    shuffle: bool = True,
+) -> Dict[str, object]:
+    if dataset_size <= 0:
+        raise ValueError("dataset_size must be > 0")
+    if mean_batch_size <= 0:
+        raise ValueError("mean_batch_size must be > 0")
+    if not (0 < delta < 1):
+        raise ValueError("delta must be in (0, 1)")
+
+    epsilon = compute_epsilon_for_range(mean_batch_size, delta)
+
+    indices = list(range(dataset_size))
+    if shuffle:
+        random.shuffle(indices)
+
+    batch_sizes = []
+    i = 0
+    while i < dataset_size:
+        noise = sample_truncated_geometric(epsilon / 2, delta / 2)
+        batch_size = max(1, mean_batch_size + noise)
+        batch_size = min(batch_size, dataset_size - i)
+        batch_sizes.append(batch_size)
+        i += batch_size
+
+    return {
+        "indices": indices,
+        "batch_sizes": batch_sizes,
+        "sampler_epsilon": epsilon,
+        "sampler_delta": delta,
+    }

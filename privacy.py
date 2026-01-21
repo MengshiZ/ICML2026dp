@@ -203,6 +203,39 @@ def compute_epsilon_tree(num_batches: int, epochs_between_restarts: List[int], n
     eps = convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose)
     return eps
 
+
+def compute_epsilon_tree_variable_steps(steps_between_restarts: List[int], noise: float, delta: float,
+                                        tree_completion: bool, verbose=True, mem_fn=None):
+    """
+    Compute epsilon value for DP-FTRL when the number of steps per epoch varies.
+
+    :param steps_between_restarts: list of step counts between each restart
+    :param noise: noise multiplier for each step
+    :param delta: target DP delta
+    :param tree_completion: if true, use the tree completion trick which adds virtual steps to complete the binary tree
+    :param verbose: whether to print message
+    :param mem_fn: if set, will write result to the file
+    :return: the DP epsilon for DP-FTRL
+    """
+    if noise < 1e-20:
+        return float('inf')
+    if any(s < 0 for s in steps_between_restarts):
+        raise ValueError("steps_between_restarts must be non-negative")
+
+    sensitivity_sq = 0
+    for i, steps in enumerate(steps_between_restarts):
+        if steps == 0:
+            continue
+        if tree_completion and i < len(steps_between_restarts) - 1:
+            extra_steps = 2 ** (steps - 1).bit_length() - steps
+        else:
+            extra_steps = 0
+        sensitivity_sq += get_total_sensitivity_sq_same_order(steps, 1, extra_steps, mem_fn)[0]
+
+    effective_sigma = noise / np.sqrt(sensitivity_sq)
+    eps = convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose)
+    return eps
+
 # ----------------------------
 # DP-SGD accounting utilities
 # ----------------------------
@@ -264,4 +297,3 @@ def main(_):
 
 if __name__ == '__main__':
     app.run(main)
-

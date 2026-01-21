@@ -23,6 +23,7 @@ from absl import flags
 import os
 import json
 import datetime
+import random
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from tqdm import trange
 import numpy as np
@@ -30,13 +31,13 @@ import numpy as np
 import tensorflow as tf
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from opacus import PrivacyEngine
-from opacus.accountants import RDPAccountant
+from opacus import GradSampleModule
 
 from optimizers import FTRLOptimizer
 from ftrl_noise import CummuNoiseTorch, CummuNoiseEffTorch
 from nn import get_nn
 from data import get_data
+import dp_data
 import privacy as privacy_lib
 import utils
 from utils import EasyDict
@@ -66,6 +67,7 @@ flags.DEFINE_float('momentum', 0.1, 'Momentum for DP-FTRL.')
 flags.DEFINE_float('learning_rate', 0.7, 'Learning rate.')
 flags.DEFINE_integer('batch_size', 500, 'Batch size.')
 flags.DEFINE_integer('epochs', 5, 'Number of epochs.')
+flags.DEFINE_boolean('dp_dataloader', False, 'Use DP randomized batch-size dataloader.')
 
 flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of samples. If -1, write every epoch.')
 
@@ -85,6 +87,7 @@ def main(argv):
     # Setup random seed
     torch.backends.cudnn.deterministic = True
     torch.manual_seed(FLAGS.run - 1)
+    random.seed(FLAGS.run - 1)
     np.random.seed(FLAGS.run - 1)
 
     # Data
@@ -96,26 +99,58 @@ def main(argv):
     # Hyperparameters for training.
     epochs = FLAGS.epochs
     batch = FLAGS.batch_size if FLAGS.batch_size > 0 else ntrain
-    num_batches = ntrain // batch
     noise_multiplier = FLAGS.noise_multiplier
     clip = FLAGS.l2_norm_clip
+
+    # Determine target delta (matching the paper's common settings).
+    def get_delta(dataset_name: str) -> float:
+        if dataset_name in ['mnist', 'cifar10']:
+            return 1e-5
+        return 1e-6
+
+    delta = get_delta(FLAGS.data)
 
 
     # Convert trainset to PyTorch Tensors and create a PyTorch Dataset
     train_images_tensor = torch.Tensor(trainset.image)
     train_labels_tensor = torch.LongTensor(trainset.label)
 
-    
-
-    # Create a PyTorch TensorDataset
     pytorch_train_dataset = torch.utils.data.TensorDataset(train_images_tensor, train_labels_tensor)
+    pytorch_train_loader = None
+    num_batches_fixed = None
+    if FLAGS.dp_dataloader:
+        sampler_eps = dp_data.compute_epsilon_for_range(batch, delta)
+        dataloader_dp = {
+            "enabled": True,
+            "epsilon": sampler_eps,
+            "delta": delta,
+            "mean_batch_size": batch,
+        }
+    else:
+        pytorch_train_loader = torch.utils.data.DataLoader(
+            pytorch_train_dataset,
+            batch_size=batch,
+            shuffle=False,    # DataStream handles shuffling
+            drop_last=True
+        )
+        num_batches_fixed = len(pytorch_train_loader)
+        dataloader_dp = {
+            "enabled": False,
+            "epsilon": None,
+            "delta": None,
+            "mean_batch_size": batch,
+        }
 
-    pytorch_train_loader = torch.utils.data.DataLoader(
-    pytorch_train_dataset,
-    batch_size=batch, # Use your defined batch size
-    shuffle=False,    # DataStream handles shuffling
-    drop_last=True    # Ensure consistent batching with DataStream
-)
+    def _build_dp_loader():
+        loader, _, _, num_batches_epoch = dp_data.get_dp_dataloader(
+            trainset_images=train_images_tensor,
+            trainset_labels=train_labels_tensor,
+            ntrain=ntrain,
+            mean_batch_size=batch,
+            delta=delta,
+            shuffle=True,
+        )
+        return loader, num_batches_epoch
 
 
     # Backward-compatible behavior: historically --dp_ftrl toggled private vs non-private FTRL.
@@ -126,14 +161,6 @@ def main(argv):
             algo = 'ftrl_nodp'
     dp_ftrl = (algo == 'ftrl_dp')
     dp_sgd = algo in ['sgd_amp', 'sgd_noamp']
-
-    # Determine target delta (matching the paper's common settings).
-    def get_delta(dataset_name: str) -> float:
-        if dataset_name in ['mnist', 'cifar10']:
-            return 1e-5
-        return 1e-6
-
-    delta = get_delta(FLAGS.data)
 
     if not FLAGS.restart:
         FLAGS.tree_completion = False
@@ -169,45 +196,119 @@ def main(argv):
 
     # Class to output batches of data
     class DataStream:
-        def __init__(self):
+        def __init__(self, loader=None, num_batches=None):
+            self.loader = loader
+            self.num_batches = num_batches
+            self._iter = None
             self.shuffle()
 
+        def set_loader(self, loader):
+            self.loader = loader
+            self._iter = iter(self.loader)
+
+        def set_num_batches(self, num_batches):
+            self.num_batches = num_batches
+
         def shuffle(self):
+            if self.loader is not None:
+                self._iter = iter(self.loader)
+                return
             self.perm = np.random.permutation(ntrain)
             self.i = 0
 
         def __call__(self):
-            if self.i == num_batches:
+            if self.loader is not None:
+                try:
+                    data, target = next(self._iter)
+                except StopIteration:
+                    raise RuntimeError("DP dataloader exhausted before expected steps")
+                return data, target
+            if self.num_batches is None:
+                raise RuntimeError("num_batches is not set for non-DP dataloader")
+            if self.i == self.num_batches:
                 self.i = 0
             batch_idx = self.perm[self.i * batch:(self.i + 1) * batch]
             self.i += 1
             return trainset.image[batch_idx], trainset.label[batch_idx]
 
-    data_stream = DataStream()
+    data_stream = DataStream(pytorch_train_loader if FLAGS.dp_dataloader else None, num_batches_fixed)
+
+    def _clip_and_add_noise(model, clip_value: float, noise_multiplier: float,
+                            mean_batch_size: int, actual_batch_size: int,
+                            device, add_noise: bool) -> None:
+        grad_sq = None
+        for p in model.parameters():
+            if not hasattr(p, "grad_sample"):
+                continue
+            gs = p.grad_sample
+            gs = gs.view(gs.shape[0], -1)
+            sq = (gs * gs).sum(dim=1)
+            grad_sq = sq if grad_sq is None else (grad_sq + sq)
+        if grad_sq is None:
+            return
+        per_sample_norms = grad_sq.sqrt()
+        clip_coef = (clip_value / (per_sample_norms + 1e-6)).clamp(max=1.0)
+        for p in model.parameters():
+            if not hasattr(p, "grad_sample"):
+                continue
+            gs = p.grad_sample
+            coef = clip_coef.view(-1, *([1] * (gs.dim() - 1)))
+            summed = (gs * coef).sum(dim=0)
+            p.grad = summed / float(actual_batch_size)
+            if add_noise and noise_multiplier > 0:
+                noise_std = noise_multiplier * clip_value / float(mean_batch_size)
+                p.grad += torch.normal(
+                    mean=0.0,
+                    std=noise_std,
+                    size=p.grad.shape,
+                    device=p.grad.device,
+                )
+            del p.grad_sample
+
+    grad_sample_checked = False
 
     # Function to conduct training for one epoch
-    def train_loop(model, device, optimizer, cumm_noise, epoch, writer, algo_name: str):
+    def train_loop(model, device, optimizer, cumm_noise, epoch, writer, algo_name: str,
+                   num_batches_epoch: int, global_step: int, seen_images: int,
+                   next_report: int):
         model.train()
-        criterion = torch.nn.CrossEntropyLoss(reduction='mean')
+        criterion = torch.nn.CrossEntropyLoss(reduction='sum')
         losses = []
         # Use simple range instead of trange to avoid log file clutter
-        loop = range(0, num_batches * batch, batch)
+        loop = range(num_batches_epoch)
         print(f'Starting Epoch {epoch+1}/{epochs}...')
-        step = epoch * num_batches
-        for it in loop:
-            step += 1
+        for _ in loop:
+            global_step += 1
             data, target = data_stream()
-            data = torch.Tensor(data).to(device)
-            target = torch.LongTensor(target).to(device)
+            data = torch.as_tensor(data).to(device)
+            target = torch.as_tensor(target, dtype=torch.long).to(device)
 
             optimizer.zero_grad()
             output = model(data)
             loss = criterion(output, target)
             loss.backward()
+            nonlocal grad_sample_checked
+            if not grad_sample_checked:
+                missing = [name for name, p in model.named_parameters()
+                           if p.requires_grad and not hasattr(p, "grad_sample")]
+                if missing:
+                    raise RuntimeError(f"Missing grad_sample for parameters: {missing}")
+                grad_sample_checked = True
 
+            dp_training = algo_name in ['ftrl_dp', 'sgd_amp', 'sgd_noamp']
+            clip_value = clip if dp_training else float('inf')
             # --- REPLACEMENT BLOCK START ---
             if algo_name in ['sgd_amp', 'sgd_noamp']:
                 # Standard DP-SGD (Opacus handles everything)
+                _clip_and_add_noise(
+                    model=model,
+                    clip_value=clip_value,
+                    noise_multiplier=noise_multiplier,
+                    mean_batch_size=batch,
+                    actual_batch_size=data.shape[0],
+                    device=device,
+                    add_noise=True,
+                )
                 optimizer.step()
             else:
                 # DP-FTRL: We need to bypass Opacus's step to pass our tuple arguments
@@ -216,25 +317,45 @@ def main(argv):
                 #    If these methods don't exist, Opacus might be doing it via hooks (older versions)
                 if hasattr(optimizer, 'original_optimizer'): # This will be True for ftrl_dp
                  # Call the original FTRLOptimizer's step method
+                    _clip_and_add_noise(
+                        model=model,
+                        clip_value=clip_value,
+                        noise_multiplier=noise_multiplier,
+                        mean_batch_size=batch,
+                        actual_batch_size=data.shape[0],
+                        device=device,
+                        add_noise=False,
+                    )
                     optimizer.original_optimizer.step((lr, cumm_noise()))
                 else:
                     # This branch should only be hit for ftrl_nodp (non-DP FTRL)
                     # where Opacus is NOT attached, so 'optimizer' is directly FTRLOptimizer
+                    _clip_and_add_noise(
+                        model=model,
+                        clip_value=clip_value,
+                        noise_multiplier=noise_multiplier,
+                        mean_batch_size=batch,
+                        actual_batch_size=data.shape[0],
+                        device=device,
+                        add_noise=False,
+                    )
                     optimizer.step((lr, cumm_noise()))
 
             losses.append(loss.item())
 
             # Check if we just finished an epoch (or passed the report interval)
-            current_img = step * batch
-            if current_img % ntrain ==0:
+            seen_images += data.shape[0]
+            if seen_images >= next_report:
                 acc_train, acc_test = test(model, device)
-                writer.add_scalar('eval/accuracy_test', 100 * acc_test, step)
-                writer.add_scalar('eval/accuracy_train', 100 * acc_train, step)
+                writer.add_scalar('eval/accuracy_test', 100 * acc_test, global_step)
+                writer.add_scalar('eval/accuracy_train', 100 * acc_train, global_step)
                 model.train()
-                print('Step %04d Accuracy %.2f' % (step, 100 * acc_test))
+                print('Step %04d Accuracy %.2f' % (global_step, 100 * acc_test))
+                next_report += report_nimg
 
         writer.add_scalar('eval/loss_train', np.mean(losses), epoch + 1)
         print('Epoch %04d Loss %.2f' % (epoch + 1, np.mean(losses)))
+        return global_step, seen_images, next_report
 
 
     # Function for evaluating the model to get training and test accuracies
@@ -274,6 +395,8 @@ def main(argv):
     privacy_engine = None
     shapes = [p.shape for p in model.parameters()]
 
+    model = GradSampleModule(model, loss_reduction="sum")
+
     
     if algo in ['ftrl_dp', 'ftrl_nodp']:
         optimizer = FTRLOptimizer(
@@ -281,31 +404,7 @@ def main(argv):
             momentum=FLAGS.momentum,
             record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion,
         )
-        if dp_ftrl:
-            # Initialize PrivacyEngine (simpler constructor)
-            privacy_engine = PrivacyEngine() # No sample_rate, etc. here
-            privacy_engine.accountant = RDPAccountant()
-
-            # Use make_private to wrap the model and optimizer
-            # Note: make_private returns NEW model and optimizer objects
-            # You are using Opacus for clipping only (noise_multiplier=0)
-            # and manual noise for FTRL, so we pass noise_multiplier=0 to make_private.
-            # We also pass batch_size and sample_size instead of sample_rate.
-            model, optimizer, _ = privacy_engine.make_private(
-                module=model,
-                optimizer=optimizer,
-                data_loader=pytorch_train_loader, 
-                noise_multiplier=0, # Opacus for clipping only
-                max_grad_norm=clip,
-                # Pass batch_size and sample_size for Opacus's internal accounting
-                batch_size=batch,
-                sample_size=ntrain,
-                accountant_builder=RDPAccountant
-                # alphas=[] is not passed here; Opacus will use its defaults for accounting,
-                # but we're not using Opacus's accountant for DP-FTRL anyway.
-            )
-            print("DEBUG: PrivacyEngine (ftrl_dp) initialized and made private.")
-        else:
+        if not dp_ftrl:
             # For ftrl_nodp, privacy_engine remains None, as before
             privacy_engine = None # Ensure it's explicitly None if not dp_ftrl
             print("DEBUG: FTRL_NoDP, PrivacyEngine not initialized.")
@@ -325,34 +424,28 @@ def main(argv):
         # Standard PyTorch SGD optimizer
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=FLAGS.momentum)
 
-        # Initialize PrivacyEngine (simpler constructor)
-        privacy_engine = PrivacyEngine() # No sample_rate, etc. here
-        privacy_engine.accountant = RDPAccountant()
-
-        # Use make_private to wrap the model and optimizer
-        # For DP-SGD, noise_multiplier is > 0.
-        model, optimizer, _ = privacy_engine.make_private(
-            module=model,
-            optimizer=optimizer,
-            data_loader=pytorch_train_loader, 
-            noise_multiplier=noise_multiplier, # This is the actual noise for DP-SGD
-            max_grad_norm=clip,
-            # Pass batch_size and sample_size for Opacus's internal accounting
-            batch_size=batch,
-            sample_size=ntrain,
-            accountant_builder=RDPAccountant
-            # Opacus will use its default RDP orders for accounting
-        )
-        print("DEBUG: PrivacyEngine (sgd_amp/noamp) initialized and made private.")
         cumm_noise = lambda: [torch.zeros(s, device=device) for s in shapes]
 
     # The training loop.
     writer = SummaryWriter(os.path.join(log_dir, 'tb'))
+    global_step = 0
+    seen_images = 0
+    next_report = report_nimg
+    batches_per_epoch = []
     for epoch in range(epochs):
+        if FLAGS.dp_dataloader:
+            pytorch_train_loader, num_batches_epoch = _build_dp_loader()
+            data_stream.set_loader(pytorch_train_loader)
+        else:
+            num_batches_epoch = num_batches_fixed
         if algo in ['sgd_amp', 'sgd_noamp']:
             # DP-SGD baselines use per-epoch reshuffling.
             data_stream.shuffle()
-        train_loop(model, device, optimizer, cumm_noise, epoch, writer, algo)
+        global_step, seen_images, next_report = train_loop(
+            model, device, optimizer, cumm_noise, epoch, writer, algo,
+            num_batches_epoch, global_step, seen_images, next_report,
+        )
+        batches_per_epoch.append(num_batches_epoch)
 
         if epoch + 1 == epochs:
             break
@@ -360,7 +453,7 @@ def main(argv):
         if restart_now:
             last_noise = None
             if FLAGS.tree_completion:
-                actual_steps = num_batches * FLAGS.restart
+                actual_steps = sum(batches_per_epoch[-FLAGS.restart:])
                 next_pow_2 = 2**(actual_steps - 1).bit_length()
                 if next_pow_2 > actual_steps:
                     last_noise = cumm_noise.proceed_until(next_pow_2)
@@ -376,20 +469,19 @@ def main(argv):
             data_stream.shuffle()  # shuffle the data only when restart
 
     # Report privacy at the end.
-    total_steps = epochs * num_batches
+    total_steps = int(sum(batches_per_epoch))
     sample_rate=1.0*batch/ntrain
     eps = None
     if algo == 'ftrl_dp':
         # Translate the restart schedule into the format expected by privacy_lib.
         if FLAGS.restart and FLAGS.restart > 0:
-            epochs_between_restarts = [FLAGS.restart] * (epochs // FLAGS.restart)
-            if epochs % FLAGS.restart != 0:
-                epochs_between_restarts.append(epochs % FLAGS.restart)
+            steps_between_restarts = []
+            for start in range(0, epochs, FLAGS.restart):
+                steps_between_restarts.append(sum(batches_per_epoch[start:start + FLAGS.restart]))
         else:
-            epochs_between_restarts = [epochs]
-        eps = privacy_lib.compute_epsilon_tree(
-            num_batches=num_batches,
-            epochs_between_restarts=epochs_between_restarts,
+            steps_between_restarts = [sum(batches_per_epoch)]
+        eps = privacy_lib.compute_epsilon_tree_variable_steps(
+            steps_between_restarts=steps_between_restarts,
             noise=noise_multiplier,
             delta=delta,
             tree_completion=FLAGS.tree_completion,
@@ -416,6 +508,7 @@ def main(argv):
     acc_train, acc_test = test(model, device, desc='Final evaluation')
     print(f'Final Accuracy: train={100*acc_train:.2f}%, test={100*acc_test:.2f}%')
 
+    num_batches_mean = int(round(total_steps / max(1, epochs)))
     record = {
         "timestamp": datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat(),
         "algo": algo,
@@ -425,7 +518,8 @@ def main(argv):
         "ntest": int(testset.image.shape[0]),
         "batch_size": int(batch),
         "epochs": int(epochs),
-        "num_batches": int(num_batches),
+        "num_batches": int(num_batches_mean),
+        "num_batches_per_epoch": [int(x) for x in batches_per_epoch],
         "total_steps": int(total_steps),
         "learning_rate": float(lr),
         "momentum": float(FLAGS.momentum),
@@ -436,6 +530,12 @@ def main(argv):
         "effi_noise": bool(FLAGS.effi_noise),
         "delta": float(delta),
         "epsilon": (None if eps is None else float(eps)),
+        "training_dp_delta": float(delta),
+        "training_dp_epsilon": (None if eps is None else float(eps)),
+        "dataloader_dp_enabled": bool(dataloader_dp["enabled"]),
+        "dataloader_dp_epsilon": (None if dataloader_dp["epsilon"] is None else float(dataloader_dp["epsilon"])),
+        "dataloader_dp_delta": (None if dataloader_dp["delta"] is None else float(dataloader_dp["delta"])),
+        "dataloader_dp_mean_batch_size": int(dataloader_dp["mean_batch_size"]),
         "accuracy_train": float(acc_train),
         "accuracy_test": float(acc_test),
         "log_dir": log_dir,
