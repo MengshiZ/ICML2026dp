@@ -372,6 +372,13 @@ def main(argv):
                  optimizer.optimizer.restart(last_noise)
             else:
                 optimizer.restart(last_noise)
+
+            if (not dp_ftrl) or noise_multiplier == 0:
+                cumm_noise = CummuNoiseTorch(0, shapes, device) # std=0
+            elif not FLAGS.effi_noise:
+                cumm_noise = CummuNoiseTorch(noise_multiplier * clip / mean_batch_size, shapes, device) # <--- FIXED STD
+            else:
+                cumm_noise = CummuNoiseEffTorch(noise_multiplier * clip / mean_batch_size, shapes, device) # <--- FIXED STD
             # MODIFIED: cumm_noise object is stateful, no need to re-assign
             print("Restart Complete. Resuming training...")
         # --- END MODIFIED ---
