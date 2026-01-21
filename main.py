@@ -118,8 +118,15 @@ def main(argv):
     pytorch_train_dataset = torch.utils.data.TensorDataset(train_images_tensor, train_labels_tensor)
     pytorch_train_loader = None
     num_batches_fixed = None
+    dp_plan = None
     if FLAGS.dp_dataloader:
-        sampler_eps = dp_data.compute_epsilon_for_range(batch, delta)
+        dp_plan = dp_data.plan_dp_batches(
+            dataset_size=ntrain,
+            mean_batch_size=batch,
+            delta=delta,
+            shuffle=True,
+        )
+        sampler_eps = dp_plan["sampler_epsilon"]
         dataloader_dp = {
             "enabled": True,
             "epsilon": sampler_eps,
@@ -149,6 +156,7 @@ def main(argv):
             mean_batch_size=batch,
             delta=delta,
             shuffle=True,
+            plan=dp_plan,
         )
         return loader, num_batches_epoch
 
@@ -273,7 +281,8 @@ def main(argv):
                    next_report: int):
         model.train()
         criterion = torch.nn.CrossEntropyLoss(reduction='sum')
-        losses = []
+        total_loss = 0.0
+        epoch_seen = 0
         # Use simple range instead of trange to avoid log file clutter
         loop = range(num_batches_epoch)
         print(f'Starting Epoch {epoch+1}/{epochs}...')
@@ -341,7 +350,8 @@ def main(argv):
                     )
                     optimizer.step((lr, cumm_noise()))
 
-            losses.append(loss.item())
+            total_loss += loss.item()
+            epoch_seen += data.shape[0]
 
             # Check if we just finished an epoch (or passed the report interval)
             seen_images += data.shape[0]
@@ -353,8 +363,9 @@ def main(argv):
                 print('Step %04d Accuracy %.2f' % (global_step, 100 * acc_test))
                 next_report += report_nimg
 
-        writer.add_scalar('eval/loss_train', np.mean(losses), epoch + 1)
-        print('Epoch %04d Loss %.2f' % (epoch + 1, np.mean(losses)))
+        avg_loss = total_loss / max(1, epoch_seen)
+        writer.add_scalar('eval/loss_train', avg_loss, epoch + 1)
+        print('Epoch %04d Loss %.2f' % (epoch + 1, avg_loss))
         return global_step, seen_images, next_report
 
 
