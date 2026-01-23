@@ -34,7 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 from opacus import GradSampleModule
 
 from optimizers import FTRLOptimizer
-from ftrl_noise import CummuNoiseTorch, CummuNoiseEffTorch
+from ftrl_noise import CummuNoiseTorch, CummuNoiseEffTorch, CummuNoiseLR
 from nn import get_nn
 from data import get_data
 import dp_data
@@ -49,19 +49,20 @@ flags.DEFINE_enum('data', 'emnist_merge', ['mnist', 'cifar10', 'emnist_merge'], 
 
 # Training algorithm.
 # - ftrl_dp: DP-FTRL / DP-FTRLM (tree noise; Opacus used for clipping only)
+# - ftrl_dp_matrix: DP-FTRL / DP-FTRLM with L=R prefix-sum (matrix) noise
 # - ftrl_nodp: vanilla (non-private) FTRL/FTRLM
 # - sgd_amp: DP-SGD with Opacus accounting (subsampling amplification)
 # - sgd_noamp: DP-SGD training, but privacy is *reported* without subsampling amplification
-flags.DEFINE_enum('algo', 'sgd_amp', ['ftrl_dp', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
+flags.DEFINE_enum('algo', 'sgd_amp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
                   'Training algorithm. See source for details.')
 
 flags.DEFINE_boolean('dp_ftrl', True, 'If True, train with DP-FTRL. If False, train with vanilla FTRL.')
 flags.DEFINE_float('noise_multiplier', 0.3, 'Ratio of the standard deviation to the clipping norm.')
 flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
 
-flags.DEFINE_integer('restart', 1, 'If > 0, restart the tree every this number of epoch(s).')
+flags.DEFINE_integer('restart', 1, 'If > 0, restart the DP-FTRL aggregator every this number of epoch(s).')
 flags.DEFINE_boolean('effi_noise', True, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
-flags.DEFINE_boolean('tree_completion', True, 'If true, generate until reaching a power of 2.')
+flags.DEFINE_boolean('tree_completion', True, 'If true, use the tree completion trick (tree noise only).')
 
 flags.DEFINE_float('momentum', 0.1, 'Momentum for DP-FTRL.')
 flags.DEFINE_float('learning_rate', 0.7, 'Learning rate.')
@@ -126,6 +127,7 @@ def main(argv):
             delta=delta,
             shuffle=True,
         )
+        num_batches_fixed = len(dp_plan["batch_sizes"])
         sampler_eps = dp_plan["sampler_epsilon"]
         dataloader_dp = {
             "enabled": True,
@@ -134,8 +136,11 @@ def main(argv):
             "mean_batch_size": batch,
         }
     else:
+        perm = torch.randperm(ntrain).tolist()
+        fixed_dataset = torch.utils.data.Subset(pytorch_train_dataset, perm)
+
         pytorch_train_loader = torch.utils.data.DataLoader(
-            pytorch_train_dataset,
+            fixed_dataset,
             batch_size=batch,
             shuffle=False,    # DataStream handles shuffling
             drop_last=True
@@ -164,14 +169,22 @@ def main(argv):
     # Backward-compatible behavior: historically --dp_ftrl toggled private vs non-private FTRL.
     # If the user didn't change --algo from its default, respect --dp_ftrl.
     algo = FLAGS.algo
-    if algo in ['ftrl_dp', 'ftrl_nodp'] and (FLAGS.algo == 'ftrl_dp'):
+    if algo in ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp'] and (FLAGS.algo == 'ftrl_dp'):
         if not FLAGS.dp_ftrl:
             algo = 'ftrl_nodp'
-    dp_ftrl = (algo == 'ftrl_dp')
+    dp_ftrl = algo in ['ftrl_dp', 'ftrl_dp_matrix']
     dp_sgd = algo in ['sgd_amp', 'sgd_noamp']
 
-    if not FLAGS.restart:
+    restart_epochs = FLAGS.restart
+    if algo == 'ftrl_dp_matrix' and FLAGS.dp_dataloader and restart_epochs != 1:
+        print("WARNING: ftrl_dp_matrix with randomized batch sizes forces --restart=1 for valid accounting.")
+        restart_epochs = 1
+    if not restart_epochs:
         FLAGS.tree_completion = False
+    if algo == 'ftrl_dp_matrix' and FLAGS.tree_completion:
+        print("WARNING: --tree_completion is ignored for ftrl_dp_matrix.")
+        FLAGS.tree_completion = False
+    effi_noise = FLAGS.effi_noise if algo == 'ftrl_dp' else False
     lr = FLAGS.learning_rate
 
     report_nimg = ntrain if FLAGS.report_nimg == -1 else FLAGS.report_nimg
@@ -181,11 +194,11 @@ def main(argv):
     log_dir = os.path.join(FLAGS.dir, FLAGS.data,
                            utils.get_fn(EasyDict(batch=batch),
                                         EasyDict(dpsgd=(dp_ftrl or dp_sgd), algo=algo,
-                                                 restart=FLAGS.restart, completion=FLAGS.tree_completion,
+                                                 restart=restart_epochs, completion=FLAGS.tree_completion,
                                                  noise=noise_multiplier, clip=clip, mb=1),
                                         [EasyDict({'lr': lr}),
                                          EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None,
-                                                  effi=FLAGS.effi_noise),
+                                                  effi=effi_noise),
                                          EasyDict(sd=FLAGS.run)]
                                         )
                            )
@@ -239,7 +252,7 @@ def main(argv):
             self.i += 1
             return trainset.image[batch_idx], trainset.label[batch_idx]
 
-    data_stream = DataStream(pytorch_train_loader if FLAGS.dp_dataloader else None, num_batches_fixed)
+    data_stream = DataStream(pytorch_train_loader, num_batches_fixed)
 
     def _clip_and_add_noise(model, clip_value: float, noise_multiplier: float,
                             mean_batch_size: int, actual_batch_size: int,
@@ -304,7 +317,7 @@ def main(argv):
                     raise RuntimeError(f"Missing grad_sample for parameters: {missing}")
                 grad_sample_checked = True
 
-            dp_training = algo_name in ['ftrl_dp', 'sgd_amp', 'sgd_noamp']
+            dp_training = algo_name in ['ftrl_dp', 'ftrl_dp_matrix', 'sgd_amp', 'sgd_noamp']
             clip_value = clip if dp_training else float('inf')
             # --- REPLACEMENT BLOCK START ---
             if algo_name in ['sgd_amp', 'sgd_noamp']:
@@ -324,7 +337,7 @@ def main(argv):
                 
                 # 1. Attempt to trigger Opacus privacy logic (Clipping/Accounting)
                 #    If these methods don't exist, Opacus might be doing it via hooks (older versions)
-                if hasattr(optimizer, 'original_optimizer'): # This will be True for ftrl_dp
+                if hasattr(optimizer, 'original_optimizer'): # This will be True for ftrl_dp / ftrl_dp_matrix
                  # Call the original FTRLOptimizer's step method
                     _clip_and_add_noise(
                         model=model,
@@ -397,7 +410,7 @@ def main(argv):
     #
     # For DP-FTRL:
     #   - Use Opacus for per-sample gradient computation + clipping only (noise_multiplier=0).
-    #   - Inject correlated tree noise via CummuNoise* and update via FTRLOptimizer.
+    #   - Inject correlated tree/matrix noise via CummuNoise* and update via FTRLOptimizer.
     #
     # For DP-SGD:
     #   - Use standard SGD, and let Opacus add i.i.d. Gaussian noise (noise_multiplier>0).
@@ -409,27 +422,39 @@ def main(argv):
     model = GradSampleModule(model, loss_reduction="sum")
 
     
-    if algo in ['ftrl_dp', 'ftrl_nodp']:
+    if algo in ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp']:
         optimizer = FTRLOptimizer(
             model.parameters(),
             momentum=FLAGS.momentum,
-            record_last_noise=FLAGS.restart > 0 and FLAGS.tree_completion,
+            record_last_noise=(algo != 'ftrl_dp_matrix') and restart_epochs > 0,
         )
         if not dp_ftrl:
             # For ftrl_nodp, privacy_engine remains None, as before
             privacy_engine = None # Ensure it's explicitly None if not dp_ftrl
             print("DEBUG: FTRL_NoDP, PrivacyEngine not initialized.")
             
-        def get_cumm_noise(effi_noise: bool):
+        def get_cumm_noise(algo_name: str, effi_noise: bool, num_steps=None):
             # When DP is disabled (or noise_multiplier=0), return correctly-shaped zeros so
             # downstream optimizer code never relies on broadcasting.
             if (not dp_ftrl) or noise_multiplier == 0:
                 return CummuNoiseTorch(0, shapes, device)
+            if algo_name == 'ftrl_dp_matrix':
+                return CummuNoiseLR(noise_multiplier * clip / batch, shapes, device, num_steps=num_steps)
             if not effi_noise:
                 return CummuNoiseTorch(noise_multiplier * clip / batch, shapes, device)
             return CummuNoiseEffTorch(noise_multiplier * clip / batch, shapes, device)
 
-        cumm_noise = get_cumm_noise(FLAGS.effi_noise)
+        def _segment_steps(start_epoch, steps_per_epoch):
+            if steps_per_epoch is None:
+                return None
+            if restart_epochs and restart_epochs > 0:
+                seg_epochs = min(restart_epochs, epochs - start_epoch)
+            else:
+                seg_epochs = epochs - start_epoch
+            return seg_epochs * steps_per_epoch
+
+        initial_steps = _segment_steps(0, num_batches_fixed) if algo == 'ftrl_dp_matrix' else None
+        cumm_noise = get_cumm_noise(algo, effi_noise, initial_steps)
 
     else: # This block handles 'sgd_amp' and 'sgd_noamp'
         # Standard PyTorch SGD optimizer
@@ -460,14 +485,16 @@ def main(argv):
 
         if epoch + 1 == epochs:
             break
-        restart_now = (algo in ['ftrl_dp', 'ftrl_nodp']) and epoch < epochs - 1 and FLAGS.restart > 0 and (epoch + 1) % FLAGS.restart == 0
+        restart_now = (algo in ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp']) and epoch < epochs - 1 and restart_epochs > 0 and (epoch + 1) % restart_epochs == 0
         if restart_now:
             last_noise = None
             if FLAGS.tree_completion:
-                actual_steps = sum(batches_per_epoch[-FLAGS.restart:])
+                actual_steps = sum(batches_per_epoch[-restart_epochs:])
                 next_pow_2 = 2**(actual_steps - 1).bit_length()
                 if next_pow_2 > actual_steps:
                     last_noise = cumm_noise.proceed_until(next_pow_2)
+            if algo == 'ftrl_dp_matrix':
+                last_noise = [torch.zeros(shape, device=device) for shape in shapes]
             
             # Unwrap to find the restart method
             if hasattr(optimizer, 'original_optimizer'):
@@ -476,19 +503,58 @@ def main(argv):
                  optimizer.optimizer.restart(last_noise)
             else:
                 optimizer.restart(last_noise)
-            cumm_noise = get_cumm_noise(FLAGS.effi_noise)
+            next_steps = _segment_steps(epoch + 1, num_batches_fixed) if algo == 'ftrl_dp_matrix' else None
+            cumm_noise = get_cumm_noise(algo, effi_noise, next_steps)
             data_stream.shuffle()  # shuffle the data only when restart
 
     # Report privacy at the end.
     total_steps = int(sum(batches_per_epoch))
     sample_rate=1.0*batch/ntrain
     eps = None
-    if algo == 'ftrl_dp':
+    if algo == 'ftrl_dp_matrix':
+        if not batches_per_epoch:
+            raise RuntimeError("No batch counts recorded for matrix accounting.")
+        steps_per_epoch = batches_per_epoch[0]
+        steps_fixed = all(b == steps_per_epoch for b in batches_per_epoch)
+        if steps_fixed:
+            if restart_epochs and restart_epochs > 0:
+                epochs_between_restarts = []
+                for start in range(0, epochs, restart_epochs):
+                    epochs_between_restarts.append(min(restart_epochs, epochs - start))
+            else:
+                epochs_between_restarts = [epochs]
+            eps = privacy_lib.compute_epsilon_lr(
+                steps_per_epoch=steps_per_epoch,
+                epochs_between_restarts=epochs_between_restarts,
+                noise=noise_multiplier,
+                delta=delta,
+                verbose=False,
+            )
+            print(f'Privacy (DP-FTRL matrix): (ε={eps:.3f}, δ={delta}) over {total_steps} steps')
+        else:
+            if restart_epochs and restart_epochs > 0:
+                steps_between_restarts = []
+                for start in range(0, epochs, restart_epochs):
+                    steps_between_restarts.append(sum(batches_per_epoch[start:start + restart_epochs]))
+            else:
+                steps_between_restarts = [sum(batches_per_epoch)]
+            eps = privacy_lib.compute_epsilon_lr_variable_steps(
+                steps_between_restarts=steps_between_restarts,
+                noise=noise_multiplier,
+                delta=delta,
+                verbose=False,
+            )
+            print(
+                "WARNING: Matrix accounting is using variable-steps bound "
+                "(fixed-order k=1) because steps per epoch vary."
+            )
+            print(f'Privacy (DP-FTRL matrix, variable steps): (ε={eps:.3f}, δ={delta}) over {total_steps} steps')
+    elif algo == 'ftrl_dp':
         # Translate the restart schedule into the format expected by privacy_lib.
-        if FLAGS.restart and FLAGS.restart > 0:
+        if restart_epochs and restart_epochs > 0:
             steps_between_restarts = []
-            for start in range(0, epochs, FLAGS.restart):
-                steps_between_restarts.append(sum(batches_per_epoch[start:start + FLAGS.restart]))
+            for start in range(0, epochs, restart_epochs):
+                steps_between_restarts.append(sum(batches_per_epoch[start:start + restart_epochs]))
         else:
             steps_between_restarts = [sum(batches_per_epoch)]
         eps = privacy_lib.compute_epsilon_tree_variable_steps(
@@ -536,9 +602,14 @@ def main(argv):
         "momentum": float(FLAGS.momentum),
         "l2_norm_clip": float(clip),
         "noise_multiplier": float(noise_multiplier),
-        "restart": int(FLAGS.restart),
+        "restart": int(restart_epochs),
         "tree_completion": bool(FLAGS.tree_completion),
-        "effi_noise": bool(FLAGS.effi_noise),
+        "effi_noise": bool(effi_noise),
+        "ftrl_noise": (
+            "matrix"
+            if algo == "ftrl_dp_matrix"
+            else ("tree_effi" if algo == "ftrl_dp" and effi_noise else ("tree" if algo == "ftrl_dp" else "na"))
+        ),
         "delta": float(delta),
         "epsilon": (None if eps is None else float(eps)),
         "training_dp_delta": float(delta),

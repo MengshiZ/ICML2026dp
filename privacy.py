@@ -236,6 +236,94 @@ def compute_epsilon_tree_variable_steps(steps_between_restarts: List[int], noise
     eps = convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose)
     return eps
 
+
+def _lr_sensitivity_sq_same_order(steps_per_epoch: int, epochs: int) -> float:
+    """
+    Sensitivity^2 for the L=R factorization under fixed-order (k=epochs) participation.
+    For epochs=1 this reduces to the max column norm of R.
+    """
+    if steps_per_epoch <= 0:
+        raise ValueError("steps_per_epoch must be positive")
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+
+    n = steps_per_epoch * epochs
+    f = np.empty(n, dtype=np.float64)
+    f[0] = 1.0
+    for i in range(1, n):
+        f[i] = f[i - 1] * (2 * i - 1) / (2 * i)
+
+    if epochs == 1:
+        return float(np.dot(f, f))
+
+    d_values = [m * steps_per_epoch for m in range(epochs)]
+    prefix = {}
+    for d in d_values:
+        prod = f[: n - d] * f[d:]
+        prefix[d] = np.cumsum(prod)
+
+    max_sq = 0.0
+    for b in range(steps_per_epoch):
+        positions = [b + e * steps_per_epoch for e in range(epochs)]
+        total = 0.0
+        for idx_i, i in enumerate(positions):
+            u_max = n - 1 - i
+            total += prefix[0][u_max]
+            for idx_j in range(idx_i + 1, epochs):
+                j = positions[idx_j]
+                if i < j:
+                    d = j - i
+                    u_max = n - 1 - j
+                else:
+                    d = i - j
+                    u_max = n - 1 - i
+                total += 2.0 * prefix[d][u_max]
+        if total > max_sq:
+            max_sq = total
+    return float(max_sq)
+
+
+def compute_epsilon_lr(steps_per_epoch: int, epochs_between_restarts: List[int],
+                       noise: float, delta: float, verbose: bool = True) -> float:
+    """
+    Compute epsilon for the L=R factorization (LR mechanism) under fixed-order participation.
+    """
+    if noise < 1e-20:
+        return float('inf')
+
+    sensitivity_sq = 0.0
+    for epochs in epochs_between_restarts:
+        if epochs == 0:
+            continue
+        sensitivity_sq += _lr_sensitivity_sq_same_order(steps_per_epoch, epochs)
+
+    effective_sigma = noise / np.sqrt(sensitivity_sq)
+    eps = convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose)
+    return eps
+
+
+def compute_epsilon_lr_variable_steps(steps_between_restarts: List[int],
+                                      noise: float, delta: float,
+                                      verbose: bool = True) -> float:
+    """
+    Compute epsilon for the LR mechanism when each restart segment is a single epoch
+    with a possibly different number of steps.
+    """
+    if noise < 1e-20:
+        return float('inf')
+    if any(s < 0 for s in steps_between_restarts):
+        raise ValueError("steps_between_restarts must be non-negative")
+
+    sensitivity_sq = 0.0
+    for steps in steps_between_restarts:
+        if steps == 0:
+            continue
+        sensitivity_sq += _lr_sensitivity_sq_same_order(steps, 1)
+
+    effective_sigma = noise / np.sqrt(sensitivity_sq)
+    eps = convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose)
+    return eps
+
 # ----------------------------
 # DP-SGD accounting utilities
 # ----------------------------

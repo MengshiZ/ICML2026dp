@@ -189,7 +189,7 @@ def plan_dp_batches(
     batch_sizes = []
     i = 0
     while i < dataset_size:
-        noise = sample_truncated_geometric(epsilon / 2, delta / 2)
+        noise = sample_truncated_geometric(epsilon, delta)
         batch_size = max(1, mean_batch_size + noise)
         batch_size = min(batch_size, dataset_size - i)
         batch_sizes.append(batch_size)

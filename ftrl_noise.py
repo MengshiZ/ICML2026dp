@@ -164,6 +164,108 @@ class CummuNoiseEffTorch:
         return noise_sum
 
 
+class CummuNoiseLR:
+    """
+    Factorized prefix-sum mechanism with L=R and L[i,j]=f(i-j).
+
+    f(0)=1, f(i)=f(i-1)*(2i-1)/(2i) for i>=1. Noise is generated as L z,
+    where z is i.i.d. Gaussian noise per step.
+    """
+    @torch.no_grad()
+    def __init__(self, std, shapes, device, test_mode=False, num_steps=None):
+        if std < 0:
+            raise ValueError("std must be non-negative")
+        if num_steps is not None and num_steps <= 0:
+            raise ValueError("num_steps must be positive when provided")
+        self.std = float(std)
+        self.shapes = list(shapes)
+        self.device = device
+        self.step = 0
+        self.test_mode = test_mode
+        self._f = [1.0]
+        self._z_hist = []
+        self._zero_noise = [torch.zeros(shape, device=self.device) for shape in self.shapes]
+        self._precomputed = None
+        self._pre_idx = 0
+        if num_steps is not None:
+            self._precompute(num_steps)
+
+    def _append_f(self):
+        i = len(self._f)
+        self._f.append(self._f[-1] * (2 * i - 1) / (2 * i))
+
+    @torch.no_grad()
+    def _precompute(self, num_steps: int):
+        if self.std <= 0 and not self.test_mode:
+            self._precomputed = [self._zero_noise for _ in range(num_steps)]
+            self._pre_idx = 0
+            self.step = 0
+            return
+
+        f = torch.empty(num_steps, device=self.device)
+        f[0] = 1.0
+        for i in range(1, num_steps):
+            f[i] = f[i - 1] * (2 * i - 1) / (2 * i)
+
+        l_mat = torch.zeros((num_steps, num_steps), device=self.device)
+        for k in range(num_steps):
+            l_mat[k:, k] = f[: num_steps - k]
+
+        precomputed = [[] for _ in range(num_steps)]
+        for shape in self.shapes:
+            if self.test_mode:
+                z = torch.ones((num_steps, *shape), device=self.device)
+            else:
+                z = torch.normal(0, self.std, size=(num_steps, *shape), device=self.device)
+            # Compute L @ z over the time axis.
+            noise = torch.tensordot(l_mat, z, dims=([1], [0]))
+            for t in range(num_steps):
+                precomputed[t].append(noise[t])
+        self._precomputed = precomputed
+        self._pre_idx = 0
+        self.step = 0
+
+    @torch.no_grad()
+    def __call__(self):
+        if self._precomputed is not None:
+            if self._pre_idx >= len(self._precomputed):
+                raise ValueError("Exceeded precomputed noise length.")
+            out = self._precomputed[self._pre_idx]
+            self._pre_idx += 1
+            self.step += 1
+            return out
+
+        if self.std <= 0 and not self.test_mode:
+            self.step += 1
+            return self._zero_noise
+
+        if self.test_mode:
+            z_step = [torch.ones(shape, device=self.device) for shape in self.shapes]
+        else:
+            z_step = [torch.normal(0, self.std, shape).to(self.device) for shape in self.shapes]
+        self._z_hist.append(z_step)
+        if len(self._f) < len(self._z_hist):
+            self._append_f()
+
+        t = len(self._z_hist) - 1
+        out = [torch.zeros(shape, device=self.device) for shape in self.shapes]
+        for k, z_k in enumerate(self._z_hist):
+            coeff = float(self._f[t - k])
+            for i, z in enumerate(z_k):
+                out[i].add_(z, alpha=coeff)
+
+        self.step += 1
+        return out
+
+    @torch.no_grad()
+    def proceed_until(self, step_target):
+        if self.step >= step_target:
+            raise ValueError(f"Already reached {step_target}.")
+        while self.step < step_target:
+            noise = self.__call__()
+        return noise
+
+
 def main(argv):
     # This is a small test. If we set the noise in each node as 1 (by setting
     # test_mode=True), we should be seeing the returned noise as the number of

@@ -64,10 +64,16 @@ class VGG(nn.Module):
 
         self.conv1_1 = nn.Conv2d(colors, 32, 3, padding=1)
         self.conv1_2 = nn.Conv2d(32, 32, 3, padding=1)
+        self.bn1_1 = nn.BatchNorm2d(32)
+        self.bn1_2 = nn.BatchNorm2d(32)
         self.conv2_1 = nn.Conv2d(32, 64, 3, padding=1)
         self.conv2_2 = nn.Conv2d(64, 64, 3, padding=1)
+        self.bn2_1 = nn.BatchNorm2d(64)
+        self.bn2_2 = nn.BatchNorm2d(64)
         self.conv3_1 = nn.Conv2d(64, 128, 3, padding=1)
         self.conv3_2 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn3_1 = nn.BatchNorm2d(128)
+        self.bn3_2 = nn.BatchNorm2d(128)
 
         self.fc1 = nn.Linear(128 * 16, dense_size)
         self.fc2 = nn.Linear(dense_size, nclass)
@@ -78,16 +84,16 @@ class VGG(nn.Module):
         self._name = 'VGG' + str(dense_size)
 
     def forward(self, x):
-        x = self.activation(self.conv1_1(x))
-        x = self.activation(self.conv1_2(x))
+        x = self.activation(self.bn1_1(self.conv1_1(x)))
+        x = self.activation(self.bn1_2(self.conv1_2(x)))
         x = F.max_pool2d(x, 2, 2)
 
-        x = self.activation(self.conv2_1(x))
-        x = self.activation(self.conv2_2(x))
+        x = self.activation(self.bn2_1(self.conv2_1(x)))
+        x = self.activation(self.bn2_2(self.conv2_2(x)))
         x = F.max_pool2d(x, 2, 2)
 
-        x = self.activation(self.conv3_1(x))
-        x = self.activation(self.conv3_2(x))
+        x = self.activation(self.bn3_1(self.conv3_1(x)))
+        x = self.activation(self.bn3_2(self.conv3_2(x)))
         x = F.max_pool2d(x, 2, 2)
 
         x = x.reshape(-1, 128 * 4 * 4)
@@ -129,7 +135,7 @@ class SMALL_NN(nn.Module):
 def get_nn(model_name, nclass, colors=3):
     if model_name.startswith('vgg'):
         model = VGG(nclass=nclass, dense_size=int(model_name[3:]),
-                    activation=torch.tanh, colors=colors)
+                    activation=torch.relu, colors=colors)
     elif model_name == 'small_nn':
         model = SMALL_NN(nclass)
     else:
