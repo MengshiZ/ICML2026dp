@@ -45,7 +45,7 @@ from utils import EasyDict
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('data', 'emnist_merge', ['mnist', 'cifar10', 'emnist_merge'], '')
+flags.DEFINE_enum('data', 'cifar10', ['mnist', 'cifar10', 'emnist_merge'], '')
 
 # Training algorithm.
 # - ftrl_dp: DP-FTRL / DP-FTRLM (tree noise; Opacus used for clipping only)
@@ -57,7 +57,7 @@ flags.DEFINE_enum('algo', 'sgd_amp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 
                   'Training algorithm. See source for details.')
 
 flags.DEFINE_boolean('dp_ftrl', True, 'If True, train with DP-FTRL. If False, train with vanilla FTRL.')
-flags.DEFINE_float('noise_multiplier', 0.3, 'Ratio of the standard deviation to the clipping norm.')
+flags.DEFINE_float('noise_multiplier', 4, 'Ratio of the standard deviation to the clipping norm.')
 flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
 
 flags.DEFINE_integer('restart', 1, 'If > 0, restart the DP-FTRL aggregator every this number of epoch(s).')
@@ -113,7 +113,7 @@ def main(argv):
 
 
     # Convert trainset to PyTorch Tensors and create a PyTorch Dataset
-    train_images_tensor = torch.Tensor(trainset.image)
+    train_images_tensor = torch.from_numpy(trainset.image).float()
     train_labels_tensor = torch.LongTensor(trainset.label)
 
     pytorch_train_dataset = torch.utils.data.TensorDataset(train_images_tensor, train_labels_tensor)
@@ -142,7 +142,7 @@ def main(argv):
         pytorch_train_loader = torch.utils.data.DataLoader(
             fixed_dataset,
             batch_size=batch,
-            shuffle=False,    # DataStream handles shuffling
+            shuffle=True,    # DataStream handles shuffling
             drop_last=True
         )
         num_batches_fixed = len(pytorch_train_loader)
@@ -191,17 +191,33 @@ def main(argv):
     #assert report_nimg % batch == 0
 
     # Get the name of the output directory.
-    log_dir = os.path.join(FLAGS.dir, FLAGS.data,
-                           utils.get_fn(EasyDict(batch=batch),
-                                        EasyDict(dpsgd=(dp_ftrl or dp_sgd), algo=algo,
-                                                 restart=restart_epochs, completion=FLAGS.tree_completion,
-                                                 noise=noise_multiplier, clip=clip, mb=1),
-                                        [EasyDict({'lr': lr}),
-                                         EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None,
-                                                  effi=effi_noise),
-                                         EasyDict(sd=FLAGS.run)]
-                                        )
-                           )
+
+    dpdl_tag = 'dp_dataloader' if FLAGS.dp_dataloader else 'non_dp_dataloader'
+    log_dir = os.path.join(
+            FLAGS.dir,
+            FLAGS.data,
+            dpdl_tag,
+            utils.get_fn(
+                        EasyDict(batch=batch),
+                        EasyDict(
+                            dpsgd=(dp_ftrl or dp_sgd),
+                            algo=algo,
+                            restart=FLAGS.restart,
+                            completion=FLAGS.tree_completion,
+                            noise=noise_multiplier,
+                            clip=clip,
+                            mb=1
+                        ),
+                        [
+                            EasyDict({'lr': lr}),
+                            EasyDict(
+                                m=FLAGS.momentum if FLAGS.momentum > 0 else None,
+                                effi=FLAGS.effi_noise
+                            ),
+                            EasyDict(sd=FLAGS.run)
+                        ]
+                    )
+                )
     print('Model dir', log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -236,6 +252,12 @@ def main(argv):
                 return
             self.perm = np.random.permutation(ntrain)
             self.i = 0
+
+        def reset(self):
+            if self.loader is not None:
+                self._iter = iter(self.loader)
+                return
+            self.i=0
 
         def __call__(self):
             if self.loader is not None:
@@ -284,7 +306,7 @@ def main(argv):
                     size=p.grad.shape,
                     device=p.grad.device,
                 )
-            del p.grad_sample
+            p.grad_sample = None
 
     grad_sample_checked = False
 
@@ -302,7 +324,7 @@ def main(argv):
         for _ in loop:
             global_step += 1
             data, target = data_stream()
-            data = torch.as_tensor(data).to(device)
+            data = torch.as_tensor(data, dtype=torch.float32, device=device)
             target = torch.as_tensor(target, dtype=torch.long).to(device)
 
             optimizer.zero_grad()
@@ -419,7 +441,12 @@ def main(argv):
     privacy_engine = None
     shapes = [p.shape for p in model.parameters()]
 
+
     model = GradSampleModule(model, loss_reduction="sum")
+
+    for p in model.parameters():
+        if not hasattr(p, "grad_sample"):
+            p.grad_sample = None
 
     
     if algo in ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp']:
@@ -476,7 +503,7 @@ def main(argv):
             num_batches_epoch = num_batches_fixed
         if algo in ['sgd_amp', 'sgd_noamp']:
             # DP-SGD baselines use per-epoch reshuffling.
-            data_stream.shuffle()
+            data_stream.reset()
         global_step, seen_images, next_report = train_loop(
             model, device, optimizer, cumm_noise, epoch, writer, algo,
             num_batches_epoch, global_step, seen_images, next_report,
@@ -581,6 +608,10 @@ def main(argv):
         eps = privacy_lib.convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose=False)
         print(f'Privacy (DP-SGD no-amp): (ε={eps:.3f}, δ={delta}) over {total_steps} steps')
 
+
+    dploader_eps=(0 if dataloader_dp["epsilon"] is None else float(dataloader_dp["epsilon"]))
+    dploader_delta=(0 if dataloader_dp["delta"] is None else float(dataloader_dp["delta"]))
+    print(f"dp_loader privacy: (ε={dploader_eps:.3f}, δ={dploader_delta})")
     # Final evaluation + persistent recording.
     acc_train, acc_test = test(model, device, desc='Final evaluation')
     print(f'Final Accuracy: train={100*acc_train:.2f}%, test={100*acc_test:.2f}%')
