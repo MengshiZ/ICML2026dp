@@ -7,51 +7,40 @@ set -euo pipefail
 BASE_EPOCHS=5
 LARGE_EPOCHS=20
 
-LR=0.4
-MOM=0.9
+LR=4.0
+MOM=0
 CLIP=1.0
 
 OUT_DIR="runs_sweeps"
 
-# FTRL-specific knobs
+# Simulate epsilons
+# EPSILONS=(0 0.1 0.2 0.3 0.4 0.5 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0 12.0 15.0)
+EPSILONS=(0.6 0.7 0.8 0.9 1.5 2.5 3.5 4.5 5.5 6.5 7.5 8.5 9.5)
+DP_DATALOADER_VALUES=(True False)
+
+# FTRL-specific knobs (paper-style)
 RESTART=1
 TREE_COMPLETION=True
 EFFI_NOISE=False
 
-# Epsilons: 10 values from 0.1 → 32, uniform in 1/ε
-EPSILONS=($(python - <<'PY'
-import numpy as np
-inv = np.linspace(1/0.1, 1/32, 10)
-eps = 1.0 / inv
-print(" ".join(f"{e:.6g}" for e in eps))
-PY
-))
-
-############################################
-# Helpers
-############################################
 mkdir -p "${OUT_DIR}"
 stamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
 run_one () {
-  local dataset="$1"
-  local batch="$2"
-  local epochs="$3"
-  local algo="$4"
-  local eps="$5"
-  local dpdl="$6"        # true / false
-  local tag="$7"         # sweep | single
-
+  local algo="$1"
+  local eps="$2"
+  local dp_dl="$3"  # New argument for dp_dataloader
+  local tag="$4"
+  
   local ts
   ts="$(stamp)"
+  # Added dp_dl to the log filename to distinguish runs
+  local log="${OUT_DIR}/${DATA}_${algo}_${tag}_eps${eps}_dpdl${dp_dl}_${ts}.log"
 
-  local log="${OUT_DIR}/${dataset}_bs${batch}_ep${epochs}_${algo}_${tag}_dpdl${dpdl}_eps${eps}_${ts}.log"
-
-  echo "==== RUN data=${dataset} batch=${batch} epochs=${epochs} algo=${algo} eps=${eps} dp_dataloader=${dpdl}"
-  echo "==== LOG ${log}"
+  echo "==== RUN algo=${algo} eps=${eps} dp_dataloader=${dp_dl} tag=${tag} -> ${log}"
 
   export ML_DATA=/userhome/cs3/zmsxsl/data
-
+  
   python -u main.py \
     --data="${dataset}" \
     --algo="${algo}" \
@@ -61,6 +50,7 @@ run_one () {
     --momentum="${MOM}" \
     --l2_norm_clip="${CLIP}" \
     --noise_multiplier="${eps}" \
+    --dp_dataloader="${dp_dl}" \
     --restart="${RESTART}" \
     --tree_completion="${TREE_COMPLETION}" \
     --effi_noise="${EFFI_NOISE}" \
@@ -71,48 +61,30 @@ run_one () {
 
 run_dataset () {
   local dataset="$1"
-  local base_batch="$2"
+  local batch_size="$2"
+  DATA="${dataset}"
+  BATCH="${batch_size}"
 
-  for batch in "${base_batch}" "$((4 * base_batch))"; do
+  # We nest the loops: For every Algo -> For every DP_Dataloader setting -> For every Epsilon
+  
+  # ====== 1) DP-FTRL sweep ======
+  for dp_val in "${DP_DATALOADER_VALUES[@]}"; do
+    for e in "${EPSILONS[@]}"; do
+      run_one "ftrl_dp" "${e}" "${dp_val}" "sweep"
+    done
+  done
 
-    if [[ "${batch}" -eq "$((4 * base_batch))" ]]; then
-      epochs="${LARGE_EPOCHS}"
-    else
-      epochs="${BASE_EPOCHS}"
-    fi
+  # ====== 2) DP-FTRL Matrix sweep ======
+  for dp_val in "${DP_DATALOADER_VALUES[@]}"; do
+    for e in "${EPSILONS[@]}"; do
+      run_one "ftrl_dp_matrix" "${e}" "${dp_val}" "sweep"
+    done
+  done
 
-    echo "=============================="
-    echo "Dataset=${dataset}, batch=${batch}, epochs=${epochs}"
-    echo "=============================="
-
-    for dpdl in false true; do
-
-      ########################################
-      # 0) Non-private FTRL (once)
-      ########################################
-      run_one "${dataset}" "${batch}" "${epochs}" "ftrl_nodp" 0.0 "${dpdl}" "single"
-
-      ########################################
-      # 1) DP-FTRL sweep
-      ########################################
-      for eps in "${EPSILONS[@]}"; do
-        run_one "${dataset}" "${batch}" "${epochs}" "ftrl_dp" "${eps}" "${dpdl}" "sweep"
-      done
-
-      ########################################
-      # 2) DP-SGD (with amplification)
-      ########################################
-      for eps in "${EPSILONS[@]}"; do
-        run_one "${dataset}" "${batch}" "${epochs}" "sgd_amp" "${eps}" "${dpdl}" "sweep"
-      done
-
-      ########################################
-      # 3) DP-SGD (no amplification reporting)
-      ########################################
-      for eps in "${EPSILONS[@]}"; do
-        run_one "${dataset}" "${batch}" "${epochs}" "sgd_noamp" "${eps}" "${dpdl}" "sweep"
-      done
-
+  # ====== 3) DP-SGD no-amplification reporting sweep ======
+  for dp_val in "${DP_DATALOADER_VALUES[@]}"; do
+    for e in "${EPSILONS[@]}"; do
+      run_one "sgd_noamp" "${e}" "${dp_val}" "sweep"
     done
   done
 }
@@ -125,10 +97,5 @@ run_dataset "mnist"        250
 run_dataset "cifar10"      500
 run_dataset "emnist_merge" 500
 
-echo "======================================"
-echo "All sweeps finished."
-echo "Results:"
-echo "  - ${OUT_DIR}/results.jsonl"
-echo "  - ${OUT_DIR}/<dataset>/results.jsonl"
-echo "Logs:"
-echo "  - ${OUT_DIR}/*.log"
+echo "All sweeps finished. Logs in: ${OUT_DIR}"
+echo "Results JSONL should be under: ${OUT_DIR}/results.jsonl"

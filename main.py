@@ -45,7 +45,7 @@ from utils import EasyDict
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('data', 'cifar10', ['mnist', 'cifar10', 'emnist_merge'], '')
+flags.DEFINE_enum('data', 'mnist', ['mnist', 'cifar10', 'emnist_merge'], '')
 
 # Training algorithm.
 # - ftrl_dp: DP-FTRL / DP-FTRLM (tree noise; Opacus used for clipping only)
@@ -53,7 +53,7 @@ flags.DEFINE_enum('data', 'cifar10', ['mnist', 'cifar10', 'emnist_merge'], '')
 # - ftrl_nodp: vanilla (non-private) FTRL/FTRLM
 # - sgd_amp: DP-SGD with Opacus accounting (subsampling amplification)
 # - sgd_noamp: DP-SGD training, but privacy is *reported* without subsampling amplification
-flags.DEFINE_enum('algo', 'sgd_amp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
+flags.DEFINE_enum('algo', 'ftrl_dp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
                   'Training algorithm. See source for details.')
 
 flags.DEFINE_boolean('dp_ftrl', True, 'If True, train with DP-FTRL. If False, train with vanilla FTRL.')
@@ -64,11 +64,11 @@ flags.DEFINE_integer('restart', 1, 'If > 0, restart the DP-FTRL aggregator every
 flags.DEFINE_boolean('effi_noise', True, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
 flags.DEFINE_boolean('tree_completion', True, 'If true, use the tree completion trick (tree noise only).')
 
-flags.DEFINE_float('momentum', 0.1, 'Momentum for DP-FTRL.')
-flags.DEFINE_float('learning_rate', 0.7, 'Learning rate.')
+flags.DEFINE_float('momentum', 0, 'Momentum for DP-FTRL.')
+flags.DEFINE_float('learning_rate', 4.0, 'Learning rate.')
 flags.DEFINE_integer('batch_size', 500, 'Batch size.')
 flags.DEFINE_integer('epochs', 5, 'Number of epochs.')
-flags.DEFINE_boolean('dp_dataloader', False, 'Use DP randomized batch-size dataloader.')
+flags.DEFINE_boolean('dp_dataloader', True, 'Use DP randomized batch-size dataloader.')
 
 flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of samples. If -1, write every epoch.')
 
@@ -160,7 +160,7 @@ def main(argv):
             ntrain=ntrain,
             mean_batch_size=batch,
             delta=delta,
-            shuffle=True,
+            shuffle=False,
             plan=dp_plan,
         )
         return loader, num_batches_epoch

@@ -59,11 +59,11 @@ class FTRLOptimizer(torch.optim.Optimizer):
                 gs, ms = param_state['grad_sum'], param_state['model_sum']
                 if self.momentum == 0:
                     gs.add_(d_p)
-                    p.copy_(ms + (-gs - nz) / alpha)
+                    p.copy_(ms + (-gs - nz) * alpha)
                 else:
                     gs.add_(d_p)
                     param_state['momentum'].mul_(self.momentum).add_(gs + nz)
-                    p.copy_(ms - param_state['momentum'] / alpha)
+                    p.copy_(ms - param_state['momentum'] * alpha)
                 if self.record_last_noise:
                     param_state['last_noise'].copy_(nz)
         return loss
