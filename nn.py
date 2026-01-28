@@ -113,7 +113,7 @@ class SMALL_NN(nn.Module):
 
     def forward(self, x):
         # x of shape [B, 1, 28, 28]
-        x = torch.tanh(self.conv1(x))  # -> [B, 16, 14, 14]
+        x = torch.tanh(self.conv1(x))  # -> [B,Z 16, 14, 14]
         x = F.max_pool2d(x, 2, 1)  # -> [B, 16, 13, 13]
         x = torch.tanh(self.conv2(x))  # -> [B, 32, 5, 5]
         x = F.max_pool2d(x, 2, 1)  # -> [B, 32, 4, 4]

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ====== User config ======
-EPOCHS=5
+############################################
+# User config
+############################################
+BASE_EPOCHS=5
+LARGE_EPOCHS=20
+
 LR=4.0
 MOM=0
 CLIP=1.0
 
-# Where logs/results are written (must match your code's --dir flag if it exists)
 OUT_DIR="runs_sweeps"
 
 # Simulate epsilons
@@ -21,7 +24,6 @@ TREE_COMPLETION=True
 EFFI_NOISE=False
 
 mkdir -p "${OUT_DIR}"
-
 stamp() { date -u +"%Y%m%dT%H%M%SZ"; }
 
 run_one () {
@@ -40,10 +42,10 @@ run_one () {
   export ML_DATA=/userhome/cs3/zmsxsl/data
   
   python -u main.py \
+    --data="${dataset}" \
     --algo="${algo}" \
-    --data="${DATA}" \
-    --epochs="${EPOCHS}" \
-    --batch_size="${BATCH}" \
+    --epochs="${epochs}" \
+    --batch_size="${batch}" \
     --learning_rate="${LR}" \
     --momentum="${MOM}" \
     --l2_norm_clip="${CLIP}" \
@@ -52,6 +54,7 @@ run_one () {
     --restart="${RESTART}" \
     --tree_completion="${TREE_COMPLETION}" \
     --effi_noise="${EFFI_NOISE}" \
+    --dp_dataloader="${dpdl}" \
     --dir="${OUT_DIR}" \
     2>&1 | tee "${log}"
 }
@@ -86,13 +89,12 @@ run_dataset () {
   done
 }
 
-# ====== MNIST ======
-run_dataset "mnist" 250
+############################################
+# Run all datasets
+############################################
 
-# ====== CIFAR-10 ======
-run_dataset "cifar10" 500
-
-# ====== EMNIST ======
+run_dataset "mnist"        250
+run_dataset "cifar10"      500
 run_dataset "emnist_merge" 500
 
 echo "All sweeps finished. Logs in: ${OUT_DIR}"

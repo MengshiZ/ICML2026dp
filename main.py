@@ -142,7 +142,7 @@ def main(argv):
         pytorch_train_loader = torch.utils.data.DataLoader(
             fixed_dataset,
             batch_size=batch,
-            shuffle=False,    # DataStream handles shuffling
+            shuffle=True,    # DataStream handles shuffling
             drop_last=True
         )
         num_batches_fixed = len(pytorch_train_loader)
@@ -503,7 +503,7 @@ def main(argv):
             num_batches_epoch = num_batches_fixed
         if algo in ['sgd_amp', 'sgd_noamp']:
             # DP-SGD baselines use per-epoch reshuffling.
-            data_stream.shuffle()
+            data_stream.reset()
         global_step, seen_images, next_report = train_loop(
             model, device, optimizer, cumm_noise, epoch, writer, algo,
             num_batches_epoch, global_step, seen_images, next_report,
