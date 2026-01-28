@@ -45,7 +45,7 @@ from utils import EasyDict
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_enum('data', 'emnist_merge', ['mnist', 'cifar10', 'emnist_merge'], '')
+flags.DEFINE_enum('data', 'mnist', ['mnist', 'cifar10', 'emnist_merge'], '')
 
 # Training algorithm.
 # - ftrl_dp: DP-FTRL / DP-FTRLM (tree noise; Opacus used for clipping only)
@@ -53,22 +53,22 @@ flags.DEFINE_enum('data', 'emnist_merge', ['mnist', 'cifar10', 'emnist_merge'], 
 # - ftrl_nodp: vanilla (non-private) FTRL/FTRLM
 # - sgd_amp: DP-SGD with Opacus accounting (subsampling amplification)
 # - sgd_noamp: DP-SGD training, but privacy is *reported* without subsampling amplification
-flags.DEFINE_enum('algo', 'sgd_amp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
+flags.DEFINE_enum('algo', 'ftrl_dp', ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp', 'sgd_amp', 'sgd_noamp'],
                   'Training algorithm. See source for details.')
 
 flags.DEFINE_boolean('dp_ftrl', True, 'If True, train with DP-FTRL. If False, train with vanilla FTRL.')
-flags.DEFINE_float('noise_multiplier', 0.3, 'Ratio of the standard deviation to the clipping norm.')
+flags.DEFINE_float('noise_multiplier', 4, 'Ratio of the standard deviation to the clipping norm.')
 flags.DEFINE_float('l2_norm_clip', 1.0, 'Clipping norm.')
 
 flags.DEFINE_integer('restart', 1, 'If > 0, restart the DP-FTRL aggregator every this number of epoch(s).')
 flags.DEFINE_boolean('effi_noise', True, 'If True, use tree aggregation proposed in https://privacytools.seas.harvard.edu/files/privacytools/files/honaker.pdf.')
 flags.DEFINE_boolean('tree_completion', True, 'If true, use the tree completion trick (tree noise only).')
 
-flags.DEFINE_float('momentum', 0.1, 'Momentum for DP-FTRL.')
-flags.DEFINE_float('learning_rate', 0.7, 'Learning rate.')
+flags.DEFINE_float('momentum', 0, 'Momentum for DP-FTRL.')
+flags.DEFINE_float('learning_rate', 4.0, 'Learning rate.')
 flags.DEFINE_integer('batch_size', 500, 'Batch size.')
 flags.DEFINE_integer('epochs', 5, 'Number of epochs.')
-flags.DEFINE_boolean('dp_dataloader', False, 'Use DP randomized batch-size dataloader.')
+flags.DEFINE_boolean('dp_dataloader', True, 'Use DP randomized batch-size dataloader.')
 
 flags.DEFINE_integer('report_nimg', -1, 'Write to tb every this number of samples. If -1, write every epoch.')
 
@@ -113,7 +113,7 @@ def main(argv):
 
 
     # Convert trainset to PyTorch Tensors and create a PyTorch Dataset
-    train_images_tensor = torch.Tensor(trainset.image)
+    train_images_tensor = torch.from_numpy(trainset.image).float()
     train_labels_tensor = torch.LongTensor(trainset.label)
 
     pytorch_train_dataset = torch.utils.data.TensorDataset(train_images_tensor, train_labels_tensor)
@@ -160,7 +160,7 @@ def main(argv):
             ntrain=ntrain,
             mean_batch_size=batch,
             delta=delta,
-            shuffle=True,
+            shuffle=False,
             plan=dp_plan,
         )
         return loader, num_batches_epoch
@@ -191,17 +191,33 @@ def main(argv):
     #assert report_nimg % batch == 0
 
     # Get the name of the output directory.
-    log_dir = os.path.join(FLAGS.dir, FLAGS.data,
-                           utils.get_fn(EasyDict(batch=batch),
-                                        EasyDict(dpsgd=(dp_ftrl or dp_sgd), algo=algo,
-                                                 restart=restart_epochs, completion=FLAGS.tree_completion,
-                                                 noise=noise_multiplier, clip=clip, mb=1),
-                                        [EasyDict({'lr': lr}),
-                                         EasyDict(m=FLAGS.momentum if FLAGS.momentum > 0 else None,
-                                                  effi=effi_noise),
-                                         EasyDict(sd=FLAGS.run)]
-                                        )
-                           )
+
+    dpdl_tag = 'dp_dataloader' if FLAGS.dp_dataloader else 'non_dp_dataloader'
+    log_dir = os.path.join(
+            FLAGS.dir,
+            FLAGS.data,
+            dpdl_tag,
+            utils.get_fn(
+                        EasyDict(batch=batch),
+                        EasyDict(
+                            dpsgd=(dp_ftrl or dp_sgd),
+                            algo=algo,
+                            restart=FLAGS.restart,
+                            completion=FLAGS.tree_completion,
+                            noise=noise_multiplier,
+                            clip=clip,
+                            mb=1
+                        ),
+                        [
+                            EasyDict({'lr': lr}),
+                            EasyDict(
+                                m=FLAGS.momentum if FLAGS.momentum > 0 else None,
+                                effi=FLAGS.effi_noise
+                            ),
+                            EasyDict(sd=FLAGS.run)
+                        ]
+                    )
+                )
     print('Model dir', log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -236,6 +252,12 @@ def main(argv):
                 return
             self.perm = np.random.permutation(ntrain)
             self.i = 0
+
+        def reset(self):
+            if self.loader is not None:
+                self._iter = iter(self.loader)
+                return
+            self.i=0
 
         def __call__(self):
             if self.loader is not None:
@@ -284,7 +306,7 @@ def main(argv):
                     size=p.grad.shape,
                     device=p.grad.device,
                 )
-            del p.grad_sample
+            p.grad_sample = None
 
     grad_sample_checked = False
 
@@ -302,7 +324,7 @@ def main(argv):
         for _ in loop:
             global_step += 1
             data, target = data_stream()
-            data = torch.as_tensor(data).to(device)
+            data = torch.as_tensor(data, dtype=torch.float32, device=device)
             target = torch.as_tensor(target, dtype=torch.long).to(device)
 
             optimizer.zero_grad()
@@ -419,7 +441,12 @@ def main(argv):
     privacy_engine = None
     shapes = [p.shape for p in model.parameters()]
 
+
     model = GradSampleModule(model, loss_reduction="sum")
+
+    for p in model.parameters():
+        if not hasattr(p, "grad_sample"):
+            p.grad_sample = None
 
     
     if algo in ['ftrl_dp', 'ftrl_dp_matrix', 'ftrl_nodp']:
@@ -581,6 +608,10 @@ def main(argv):
         eps = privacy_lib.convert_gaussian_renyi_to_dp(effective_sigma, delta, verbose=False)
         print(f'Privacy (DP-SGD no-amp): (ε={eps:.3f}, δ={delta}) over {total_steps} steps')
 
+
+    dploader_eps=(0 if dataloader_dp["epsilon"] is None else float(dataloader_dp["epsilon"]))
+    dploader_delta=(0 if dataloader_dp["delta"] is None else float(dataloader_dp["delta"]))
+    print(f"dp_loader privacy: (ε={dploader_eps:.3f}, δ={dploader_delta})")
     # Final evaluation + persistent recording.
     acc_train, acc_test = test(model, device, desc='Final evaluation')
     print(f'Final Accuracy: train={100*acc_train:.2f}%, test={100*acc_test:.2f}%')
